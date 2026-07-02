@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import AnalysisConfig
+from .adaptive_parser import DynamicParseRule
 from .models import EvidenceItem, Issue, LogEvent, StageOneSummary
 from .parser import iter_log_events
 
@@ -92,7 +94,82 @@ def _build_issue(
     )
 
 
-def analyze_logs(log_paths: list[Path], config: AnalysisConfig) -> StageOneSummary:
+ASYNC_METHOD_PATTERN = re.compile(r"async method:\s+public void\s+([\w$.]+)\((.*?)\)")
+LOCATION_PATTERN = re.compile(r"\[(?P<method>[A-Za-z_][\w$<>]*),(?P<line>\d+)\]")
+
+
+def _short_class_name(logger: str | None) -> str | None:
+    if not logger:
+        return None
+    return logger.split(".")[-1]
+
+
+def _extract_async_method_name(raw_line: str) -> str | None:
+    match = ASYNC_METHOD_PATTERN.search(raw_line)
+    if not match:
+        return None
+    full_method = match.group(1)
+    parts = full_method.split(".")
+    if len(parts) < 2:
+        return full_method
+    return f"{parts[-2]}.{parts[-1]}"
+
+
+def _extract_location_method(raw_line: str) -> str | None:
+    match = LOCATION_PATTERN.search(raw_line)
+    if not match:
+        return None
+    return match.group("method")
+
+
+def _error_signature_label(event: LogEvent) -> str:
+    raw_line_lower = event.raw_line.lower()
+    async_method = _extract_async_method_name(event.raw_line)
+    if async_method:
+        return f"{async_method} 异步异常"
+    if "merge sql error" in raw_line_lower:
+        return "Druid SQL 合并异常"
+    if "任务执行异常" in event.raw_line and _short_class_name(event.logger) == "AbstractQuartzJob":
+        return "Quartz 任务执行异常"
+    class_name = _short_class_name(event.logger)
+    method_name = _extract_location_method(event.raw_line)
+    if class_name and method_name:
+        return f"{class_name}.{method_name} 调用异常"
+    if class_name:
+        return f"{class_name} 异常"
+    return "未分类 ERROR 异常"
+
+
+def _derive_error_issue_title(events: list[LogEvent]) -> str:
+    if not events:
+        return "存在未处理错误日志"
+    labels = Counter(_error_signature_label(event) for event in events)
+    ranked = labels.most_common(3)
+    primary = ranked[0][0]
+    if len(ranked) == 1:
+        return primary
+    secondary, secondary_count = ranked[1]
+    if len(events) <= 3:
+        return f"{primary} 与 {secondary}"
+    if labels[primary] >= 2 or secondary_count >= 2:
+        return f"{primary} 与 {secondary}"
+    return primary
+
+
+def _derive_error_issue_description(events: list[LogEvent]) -> str:
+    if not events:
+        return "检测到 ERROR 级别日志，建议进一步排查对应代码路径。"
+    labels = Counter(_error_signature_label(event) for event in events).most_common(2)
+    if len(labels) == 1:
+        return f"检测到以“{labels[0][0]}”为主的 ERROR 日志，需要排查对应模块或调用链。"
+    return f"检测到“{labels[0][0]}”和“{labels[1][0]}”等 ERROR 日志，需要结合调用链继续排查。"
+
+
+def analyze_logs(
+    log_paths: list[Path],
+    config: AnalysisConfig,
+    dynamic_rules: dict[str, DynamicParseRule] | None = None,
+) -> StageOneSummary:
     level_counter: Counter[str] = Counter()
     endpoint_stats: dict[str, EndpointStats] = defaultdict(EndpointStats)
     file_stats: list[dict] = []
@@ -105,7 +182,8 @@ def analyze_logs(log_paths: list[Path], config: AnalysisConfig) -> StageOneSumma
     for log_path in log_paths:
         file_line_count = 0
         file_levels: Counter[str] = Counter()
-        for event in iter_log_events(log_path):
+        dynamic_rule = dynamic_rules.get(str(log_path)) if dynamic_rules else None
+        for event in iter_log_events(log_path, dynamic_rule=dynamic_rule):
             file_line_count += 1
             total_lines += 1
             level = event.level or "UNKNOWN"
@@ -201,10 +279,10 @@ def analyze_logs(log_paths: list[Path], config: AnalysisConfig) -> StageOneSumma
     if issues_by_type["error"] and not any(issue.category == "dependency" for issue in issues):
         issues.append(
             _build_issue(
-                "存在未处理错误日志",
+                _derive_error_issue_title(issues_by_type["error"]),
                 "应用",
                 "高",
-                "检测到 ERROR 级别日志，建议进一步排查对应代码路径。",
+                _derive_error_issue_description(issues_by_type["error"]),
                 issues_by_type["error"],
                 config.max_issue_evidence,
             )

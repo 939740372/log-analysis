@@ -136,7 +136,7 @@ class FixSuggestion:
 @dataclass
 class StageTwoSummary:
     generated_at: str
-    source_root: str
+    source_root: str | None
     code_matches: list[CodeReference]
     suggestions: list[FixSuggestion]
     llm_error: str | None = None

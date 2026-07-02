@@ -32,3 +32,5 @@ class AnalysisConfig:
     max_llm_samples: int = 12
     max_code_matches: int = 30
     redact_sensitive: bool = True
+    adaptive_sample_lines: int = 80
+    adaptive_validation_improvement: int = 3

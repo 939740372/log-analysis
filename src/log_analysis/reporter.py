@@ -85,7 +85,7 @@ def render_stage_two_markdown(summary: StageTwoSummary) -> str:
     lines.append("# 第二阶段修复建议")
     lines.append("")
     lines.append(f"- 生成时间：`{summary.generated_at}`")
-    lines.append(f"- 源码目录：`{summary.source_root}`")
+    lines.append(f"- 源码目录：`{summary.source_root or '未提供（纯日志模式）'}`")
     lines.append(f"- 命中的代码位置数：`{len(summary.code_matches)}`")
     lines.append("")
     for suggestion in summary.suggestions:

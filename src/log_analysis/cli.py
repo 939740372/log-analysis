@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .aggregator import analyze_logs
+from .adaptive_parser import infer_dynamic_parse_rule, sample_log_lines, validate_dynamic_rule
 from .code_linker import link_issues_to_code, select_related_code_matches
 from .config import AnalysisConfig, LLMConfig
 from .dingtalk import DingTalkConfig
@@ -24,6 +25,7 @@ from .publish import (
     send_dingtalk_report_notification,
 )
 from .reporter import render_stage_one_markdown, render_stage_two_markdown, write_json
+from .parser import parse_log_line
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,6 +38,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-model", default="InstructModelQwen3")
     parser.add_argument("--slow-threshold-ms", type=int, default=1000, help="慢请求阈值，单位毫秒。")
     parser.add_argument("--max-code-matches", type=int, default=30, help="第二阶段最多保留的代码命中数量。")
+    parser.add_argument("--adaptive-parser", action="store_true", help="先采样日志，让 LLM 生成受约束的动态解析规则。")
+    parser.add_argument("--adaptive-sample-lines", type=int, default=80, help="动态解析规则采样行数。")
+    parser.add_argument(
+        "--adaptive-validation-improvement",
+        type=int,
+        default=3,
+        help="动态规则相对内置规则至少提升多少评分才启用。",
+    )
     parser.add_argument("--report-base-url", help="报告站点的外部访问基地址，例如 https://example.com/reports")
     parser.add_argument("--dingtalk-webhook", help="钉钉机器人 webhook。配置后会推送摘要通知。")
     parser.add_argument("--dingtalk-secret", help="钉钉机器人加签 secret。")
@@ -92,6 +102,14 @@ def _ensure_list(value: object) -> list[str]:
     return [str(value)]
 
 
+def _stringify_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "；".join(str(item) for item in value if str(item).strip())
+    return str(value)
+
+
 def _notification_title(log_files: list[Path]) -> str:
     if not log_files:
         return "日志分析完成"
@@ -112,8 +130,8 @@ def _convert_issue_llm_result(
         confidence=str(item.get("confidence") or "中"),
         observed_facts=_ensure_list(item.get("observed_facts"))[:6] or [issue.description],
         linked_code=issue_matches,
-        fix_direction=str(item.get("fix_direction") or ""),
-        llm_suggestion=str(item.get("llm_suggestion") or raw_text[:500]),
+        fix_direction=_stringify_text(item.get("fix_direction") or ""),
+        llm_suggestion=_stringify_text(item.get("llm_suggestion") or raw_text[:500]),
         side_effects=_ensure_list(item.get("side_effects"))[:6],
         evidence=issue.evidence[:4],
     )
@@ -189,6 +207,13 @@ def _run_stage_two_llm(
     return ordered, None
 
 
+def _run_stage_two_without_source(
+    client: OpenAICompatibleLLMClient,
+    stage_one_summary,
+) -> tuple[list[FixSuggestion], str | None]:
+    return _run_stage_two_llm(client, stage_one_summary, [])
+
+
 def main() -> None:
     args = build_parser().parse_args()
     log_files = [Path(item).resolve() for item in args.log_files]
@@ -200,12 +225,45 @@ def main() -> None:
         output_dir=output_dir,
         slow_request_threshold_ms=args.slow_threshold_ms,
         max_code_matches=args.max_code_matches,
+        adaptive_sample_lines=args.adaptive_sample_lines,
+        adaptive_validation_improvement=args.adaptive_validation_improvement,
     )
     llm_config = LLMConfig(base_url=args.llm_base_url, model=args.llm_model)
 
-    stage_one_summary = analyze_logs(log_files, analysis_config)
-
     client = None if args.disable_llm else OpenAICompatibleLLMClient(llm_config)
+    dynamic_rules: dict[str, object] = {}
+    adaptive_decisions = []
+    if args.adaptive_parser and client is not None:
+        for log_file in log_files:
+            sample_lines = sample_log_lines(log_file, analysis_config.adaptive_sample_lines)
+            rule, raw_response, error = infer_dynamic_parse_rule(client, log_file, sample_lines)
+            if rule is None:
+                adaptive_decisions.append(
+                    {
+                        "source_file": str(log_file),
+                        "enabled": False,
+                        "reason": error or "未生成动态规则",
+                        "sample_line_count": len(sample_lines),
+                        "builtin_score": 0,
+                        "dynamic_score": 0,
+                        "rule": None,
+                        "raw_response": raw_response,
+                    }
+                )
+                continue
+            decision = validate_dynamic_rule(
+                str(log_file),
+                sample_lines,
+                rule,
+                parse_log_line,
+                min_improvement=analysis_config.adaptive_validation_improvement,
+            )
+            adaptive_decisions.append(decision.to_dict() | {"raw_response": raw_response})
+            if decision.enabled:
+                dynamic_rules[str(log_file)] = rule
+        write_json(output_dir / "adaptive_parser.json", {"decisions": adaptive_decisions})
+
+    stage_one_summary = analyze_logs(log_files, analysis_config, dynamic_rules=dynamic_rules or None)
     if client is not None:
         llm_summary, llm_error = _run_stage_one_llm_with_retry(client, stage_one_summary.to_dict())
         stage_one_summary.llm_summary = llm_summary
@@ -215,14 +273,27 @@ def main() -> None:
     (output_dir / "summary.md").write_text(render_stage_one_markdown(stage_one_summary), encoding="utf-8")
 
     if not args.source_root:
+        if client is not None:
+            suggestions, llm_error = _run_stage_two_without_source(client, stage_one_summary)
+        else:
+            suggestions, llm_error = [], "LLM 已禁用"
+        stage_two_summary = StageTwoSummary(
+            generated_at=stage_one_summary.generated_at,
+            source_root=None,
+            code_matches=[],
+            suggestions=suggestions,
+            llm_error=llm_error,
+        )
+        write_json(output_dir / "fix_suggestions.json", stage_two_summary.to_dict())
+        (output_dir / "fix_suggestions.md").write_text(render_stage_two_markdown(stage_two_summary), encoding="utf-8")
         _finalize_publication(
             output_root=output_root,
             output_dir=output_dir,
             args=args,
             log_files=log_files,
             issue_count=len(stage_one_summary.issues),
-            suggestion_count=0,
-            llm_error=stage_one_summary.llm_error,
+            suggestion_count=len(stage_two_summary.suggestions),
+            llm_error=stage_two_summary.llm_error or stage_one_summary.llm_error,
         )
         return
 

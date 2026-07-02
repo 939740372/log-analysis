@@ -38,6 +38,44 @@ class ParserTests(unittest.TestCase):
         event = parse_log_line(line, "sample.log", 3)
         self.assertIn("discard long time none received connection", " ".join(event.exception_keywords).lower())
 
+    def test_parse_time_only_error_log_uses_date_from_filename(self) -> None:
+        line = (
+            "06:30:00.176 [RuoyiScheduler_Worker-12] ERROR c.r.c.u.PushUtils - "
+            "[pushPunchAndroid,223] - ErrCode: MissingTargetValue"
+        )
+        event = parse_log_line(line, "sys-error.2026-07-01.log", 4)
+        self.assertEqual(event.level, "ERROR")
+        self.assertEqual(event.thread, "RuoyiScheduler_Worker-12")
+        self.assertEqual(event.logger, "c.r.c.u.PushUtils")
+        self.assertIsNotNone(event.timestamp)
+        self.assertEqual(event.timestamp.strftime("%Y-%m-%d %H:%M:%S.%f"), "2026-07-01 06:30:00.176000")
+        self.assertIn("MissingTargetValue", event.message)
+
+    def test_parse_wrapper_line_extracts_outer_timestamp_and_level(self) -> None:
+        line = "INFO   | jvm 1    | 2026/06/27 10:45:32 | Caused by: java.net.SocketTimeoutException: Read timed out"
+        event = parse_log_line(line, "wrapper.log.1", 5)
+        self.assertEqual(event.level, "INFO")
+        self.assertEqual(event.thread, "jvm 1")
+        self.assertEqual(event.logger, "wrapper")
+        self.assertIsNotNone(event.timestamp)
+        self.assertEqual(event.timestamp.strftime("%Y-%m-%d %H:%M:%S"), "2026-06-27 10:45:32")
+        self.assertIn("timed out", " ".join(event.exception_keywords).lower())
+
+    def test_parse_wrapper_line_prefers_embedded_time_only_log(self) -> None:
+        line = (
+            "INFO   | jvm 1    | 2026/06/27 10:13:24 | "
+            "at org.foo.Bar(Baz.java:1)10:13:23.895 [http-nio-9001-exec-32] WARN  "
+            "o.s.w.s.m.m.a.ExceptionHandlerExceptionResolver - [doResolveHandlerMethodException,434] - "
+            "Failure in @ExceptionHandler com.umsin.pms.exception.GlobalExceptionHandler#exceptionHandler(HttpServletRequest, Exception)"
+        )
+        event = parse_log_line(line, "wrapper.log.1", 6)
+        self.assertEqual(event.level, "WARN")
+        self.assertEqual(event.thread, "http-nio-9001-exec-32")
+        self.assertEqual(event.logger, "o.s.w.s.m.m.a.ExceptionHandlerExceptionResolver")
+        self.assertIsNotNone(event.timestamp)
+        self.assertEqual(event.timestamp.strftime("%Y-%m-%d %H:%M:%S.%f"), "2026-06-27 10:13:23.895000")
+        self.assertIn("GlobalExceptionHandler", event.message)
+
 
 if __name__ == "__main__":
     unittest.main()

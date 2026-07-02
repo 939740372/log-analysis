@@ -154,6 +154,8 @@ def build_stage_two_issue_messages(input_payload: dict) -> list[dict]:
                 "只分析当前这一个问题。"
                 "返回对象必须包含 title、confidence、observed_facts、fix_direction、"
                 "llm_suggestion、side_effects。"
+                "如果日志证据里已经出现明确的类名、方法名、任务名或组件名，title 必须优先使用这些具体标识，"
+                "不要写成泛化标题。"
                 "所有建议只能基于给定日志证据和代码片段推断。"
                 "如果证据不足，请明确写出证据不足，不要编造。"
             ),
@@ -161,5 +163,51 @@ def build_stage_two_issue_messages(input_payload: dict) -> list[dict]:
         {
             "role": "user",
             "content": json.dumps(input_payload, ensure_ascii=False),
+        },
+    ]
+
+
+def build_adaptive_parser_messages(input_payload: dict) -> list[dict]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是一名日志格式归纳专家。请仅返回简体中文 JSON，不要返回 Markdown。"
+                "目标是给出一个安全、可验证的日志切割规则，而不是分析业务含义。"
+                "返回对象必须包含 format_name、strategy、outer_regex、outer_timestamp_format。"
+                "strategy 只能是 direct 或 wrapper_embedded。"
+                "如为 wrapper_embedded，可额外返回 embedded_regex、embedded_timestamp_format、"
+                "embedded_uses_outer_date、logger_literal。"
+                "regex 只允许命名捕获组 timestamp、level、thread、logger、message。"
+                "如果样本明显是外层包装日志包裹内层 Spring 日志，优先返回 wrapper_embedded。"
+                "不要输出解释文字。"
+                "请严格按以下 JSON 结构返回："
+                '{"format_name":"格式名","strategy":"direct或wrapper_embedded","outer_regex":"正则","outer_timestamp_format":"时间格式",'
+                '"embedded_regex":"可选","embedded_timestamp_format":"可选","embedded_uses_outer_date":true,"logger_literal":"可选"}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(input_payload, ensure_ascii=False),
+        },
+    ]
+
+
+def build_adaptive_parser_repair_messages(raw_text: str) -> list[dict]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是一名 JSON 修复助手。"
+                "请把给定内容修复成一个合法的 JSON 对象。"
+                "不要解释，不要补充分析，只输出 JSON。"
+                "必须包含 format_name、strategy、outer_regex、outer_timestamp_format。"
+                "strategy 只能是 direct 或 wrapper_embedded。"
+                "regex 只允许命名捕获组 timestamp、level、thread、logger、message。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": raw_text,
         },
     ]
