@@ -118,11 +118,14 @@ class FixSuggestion:
     evidence: list[EvidenceItem]
 
     def to_dict(self) -> dict[str, Any]:
+        from .code_display import group_code_references
+
         return {
             "title": self.title,
             "confidence": self.confidence,
             "observed_facts": self.observed_facts,
             "linked_code": [item.to_dict() for item in self.linked_code],
+            "linked_code_groups": group_code_references(self.linked_code),
             "fix_direction": self.fix_direction,
             "llm_suggestion": self.llm_suggestion,
             "side_effects": self.side_effects,

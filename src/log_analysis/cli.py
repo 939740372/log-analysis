@@ -6,8 +6,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .aggregator import analyze_logs
-from .code_linker import link_issues_to_code
+from .code_linker import link_issues_to_code, select_related_code_matches
 from .config import AnalysisConfig, LLMConfig
+from .dingtalk import DingTalkConfig
 from .llm import (
     LLMError,
     OpenAICompatibleLLMClient,
@@ -15,19 +16,29 @@ from .llm import (
     build_stage_two_issue_messages,
 )
 from .models import CodeReference, FixSuggestion, StageTwoSummary
+from .output_paths import ensure_output_root, resolve_output_dir
+from .publish import (
+    build_report_url,
+    refresh_output_index,
+    render_classic_report_site,
+    send_dingtalk_report_notification,
+)
 from .reporter import render_stage_one_markdown, render_stage_two_markdown, write_json
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="两阶段 Java 日志分析工具。")
     parser.add_argument("log_files", nargs="+", help="输入的日志文件路径，可传多个。")
-    parser.add_argument("--output-dir", default="out", help="分析结果输出目录。")
+    parser.add_argument("--output-dir", default="analysis", help="分析结果输出目录。相对路径会自动放到 output/ 下。")
     parser.add_argument("--source-root", help="第二阶段源码分析使用的本地 Java 项目根目录。")
     parser.add_argument("--disable-llm", action="store_true", help="跳过所有 LLM 调用，仅输出规则分析结果。")
     parser.add_argument("--llm-base-url", default="http://10.130.61.232:8002")
     parser.add_argument("--llm-model", default="InstructModelQwen3")
     parser.add_argument("--slow-threshold-ms", type=int, default=1000, help="慢请求阈值，单位毫秒。")
     parser.add_argument("--max-code-matches", type=int, default=30, help="第二阶段最多保留的代码命中数量。")
+    parser.add_argument("--report-base-url", help="报告站点的外部访问基地址，例如 https://example.com/reports")
+    parser.add_argument("--dingtalk-webhook", help="钉钉机器人 webhook。配置后会推送摘要通知。")
+    parser.add_argument("--dingtalk-secret", help="钉钉机器人加签 secret。")
     return parser
 
 
@@ -60,37 +71,7 @@ def _run_stage_one_llm_with_retry(
 
 
 def _select_related_matches(issue, code_matches: list[CodeReference]) -> list[CodeReference]:
-    related: list[CodeReference] = []
-    seen: set[tuple[str, int]] = set()
-    class_short_names = {clazz.split(".")[-1] for clazz in issue.related_classes}
-    keyword_tokens = set(issue.related_keywords)
-    if issue.category == "数据库":
-        keyword_tokens.update({"druid", "validation", "keepAlive", "testWhileIdle", "DynamicDataSourceFactory"})
-    if issue.category == "应用":
-        keyword_tokens.update({"async method", "addDistance"})
-
-    for match in code_matches:
-        reason = match.reason.lower()
-        snippet = match.snippet.lower()
-        class_name = (match.class_name or "").lower()
-        method_name = (match.method_name or "").lower()
-        matched = False
-
-        if any(endpoint.lower() in reason or endpoint.lower() in snippet for endpoint in issue.related_endpoints):
-            matched = True
-        elif any(short.lower() == class_name or short.lower() in reason for short in class_short_names):
-            matched = True
-        elif any(token.lower() in reason or token.lower() in snippet or token.lower() == method_name for token in keyword_tokens):
-            matched = True
-
-        if matched:
-            key = (match.file_path, match.line_number)
-            if key not in seen:
-                seen.add(key)
-                related.append(match)
-        if len(related) >= 5:
-            break
-    return related
+    return select_related_code_matches(issue, code_matches, limit=5)
 
 
 def _normalize_llm_suggestions(parsed: object) -> list[dict]:
@@ -109,6 +90,18 @@ def _ensure_list(value: object) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value]
     return [str(value)]
+
+
+def _notification_title(log_files: list[Path]) -> str:
+    if not log_files:
+        return "日志分析完成"
+    if len(log_files) == 1:
+        return f"{log_files[0].stem}日志分析完成"
+    return f"{log_files[0].stem}等{len(log_files)}个日志分析完成"
+
+
+def _llm_status_text(llm_error: str | None) -> str:
+    return "部分异常（存在未返回合法建议的条目）" if llm_error else "正常"
 
 
 def _convert_issue_llm_result(
@@ -199,7 +192,8 @@ def _run_stage_two_llm(
 def main() -> None:
     args = build_parser().parse_args()
     log_files = [Path(item).resolve() for item in args.log_files]
-    output_dir = Path(args.output_dir).resolve()
+    output_root = ensure_output_root()
+    output_dir = resolve_output_dir(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     analysis_config = AnalysisConfig(
@@ -221,6 +215,15 @@ def main() -> None:
     (output_dir / "summary.md").write_text(render_stage_one_markdown(stage_one_summary), encoding="utf-8")
 
     if not args.source_root:
+        _finalize_publication(
+            output_root=output_root,
+            output_dir=output_dir,
+            args=args,
+            log_files=log_files,
+            issue_count=len(stage_one_summary.issues),
+            suggestion_count=0,
+            llm_error=stage_one_summary.llm_error,
+        )
         return
 
     source_root = Path(args.source_root).resolve()
@@ -239,6 +242,54 @@ def main() -> None:
     )
     write_json(output_dir / "fix_suggestions.json", stage_two_summary.to_dict())
     (output_dir / "fix_suggestions.md").write_text(render_stage_two_markdown(stage_two_summary), encoding="utf-8")
+
+    _finalize_publication(
+        output_root=output_root,
+        output_dir=output_dir,
+        args=args,
+        log_files=log_files,
+        issue_count=len(stage_one_summary.issues),
+        suggestion_count=len(stage_two_summary.suggestions),
+        llm_error=stage_two_summary.llm_error or stage_one_summary.llm_error,
+    )
+
+
+def _finalize_publication(
+    *,
+    output_root: Path,
+    output_dir: Path,
+    args,
+    log_files: list[Path],
+    issue_count: int,
+    suggestion_count: int,
+    llm_error: str | None,
+) -> None:
+    site_index = render_classic_report_site(output_dir)
+    root_index = refresh_output_index(output_root)
+    report_url = build_report_url(site_index, output_root, args.report_base_url)
+    payload: dict[str, object] = {
+        "site_index": str(site_index),
+        "output_root_index": str(root_index),
+        "report_url": report_url,
+        "dingtalk": None,
+    }
+    if args.dingtalk_webhook:
+        try:
+            response = send_dingtalk_report_notification(
+                DingTalkConfig(webhook=args.dingtalk_webhook, secret=args.dingtalk_secret),
+                title=_notification_title(log_files),
+                lines=[
+                    f"输出目录：{output_dir}",
+                    f"问题数量：{issue_count}",
+                    f"修复建议数量：{suggestion_count}",
+                    f"LLM 状态：{_llm_status_text(llm_error)}",
+                ],
+                report_url=report_url,
+            )
+            payload["dingtalk"] = {"success": True, "response": response}
+        except Exception as exc:  # noqa: BLE001
+            payload["dingtalk"] = {"success": False, "error": str(exc)}
+    write_json(output_dir / "publish.json", payload)
 
 
 if __name__ == "__main__":

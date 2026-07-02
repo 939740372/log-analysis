@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .code_display import group_code_references
 from .models import StageOneSummary, StageTwoSummary
 
 
@@ -95,11 +96,23 @@ def render_stage_two_markdown(summary: StageTwoSummary) -> str:
         for fact in suggestion.observed_facts:
             lines.append(f"  - `Observed` {fact}")
         lines.append("- 关联代码：")
-        for match in suggestion.linked_code:
-            lines.append(
-                f"  - `Linked` {match.file_path}:{match.line_number} "
-                f"({match.class_name or '-'}#{match.method_name or '-'}) {match.reason}"
-            )
+        for group in group_code_references(suggestion.linked_code):
+            classes = ", ".join(group["class_names"]) if group["class_names"] else "-"
+            methods = ", ".join(group["method_names"]) if group["method_names"] else "-"
+            reasons = "；".join(group["reasons"][:4])
+            lines.append(f"  - `Linked` {group['file_path']} 类={classes} 方法={methods} 原因={reasons}")
+            for block in group["blocks"]:
+                if block["start_line"] == block["end_line"]:
+                    lines.append(f"  - `Linked` 片段行 {block['start_line']}")
+                else:
+                    lines.append(f"  - `Linked` 片段行 {block['start_line']}-{block['end_line']}")
+                if block["context_lines"]:
+                    for context in block["context_lines"]:
+                        marker = "*" if context["line_number"] in block["hit_line_numbers"] else "-"
+                        lines.append(f"  - `Linked` {marker} {context['line_number']}: {context['content']}")
+                else:
+                    for line in block["lines"]:
+                        lines.append(f"  - `Linked` 行 {line['line_number']}: {line['snippet']}")
         lines.append(f"- Inferred 修复方向：{suggestion.fix_direction}")
         lines.append(f"- Inferred LLM 建议：{suggestion.llm_suggestion}")
         lines.append("- 可能副作用：")

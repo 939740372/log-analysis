@@ -7,14 +7,7 @@ venv/
 
 # Local logs and analysis outputs
 *.log
-demo-out/
-download-out/
-download-stage2-out/
-download-stage2-out-parallel/
-hazsub-out/
-hazsub-out-zh/
-hazsub-stage2-real/
-out/
+output/
 
 # Local scratch
 tmp_*/
