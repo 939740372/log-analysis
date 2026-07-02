@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Local logs and analysis outputs
+*.log
+demo-out/
+download-out/
+download-stage2-out/
+download-stage2-out-parallel/
+hazsub-out/
+hazsub-out-zh/
+hazsub-stage2-real/
+out/
+
+# Local scratch
+tmp_*/
+test-output/
