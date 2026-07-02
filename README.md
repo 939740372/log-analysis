@@ -1,12 +1,343 @@
 # 日志分析工具
 
-这是一个面向常见 Java 后端日志的两阶段分析 CLI。
+面向常见 Java 后端日志的两阶段分析 CLI，支持规则分析、LLM 辅助诊断和 ReAct 多步 Agent 调查。
 
-1. 第一阶段：仅基于日志做结构化分析，输出中文总结。
-2. 第二阶段：结合本地 Java 源码目录，做日志到代码的关联定位，并给出以 LLM 输出为主的修复建议。
-3. ReAct 模式：以多步调查 Agent 的方式，对重点问题做更细的日志与源码关联调查。
+## 核心模式
 
-项目重点覆盖：
+项目提供三种递进的分析模式：
+
+| 模式 | 命令 | 说明 |
+| ---- | ---- | ---- |
+| **第一阶段**（规则分析） | `analyze-logs` | 纯规则引擎解析日志，识别问题模式，输出结构化摘要 |
+| **第二阶段**（LLM 辅助） | `analyze-logs --source-root <path>` | 日志关联源码，并发调用 LLM 生成修复建议 |
+| **ReAct 模式** | `analyze-logs-react --source-root <path>` | 多步 Agent 调查，自主调用工具链做深度排查 |
+
+## 实现原理
+
+### 整体架构
+
+项目采用管道式（Pipeline）架构，按数据流向分为六个核心模块：
+
+```text
+日志文件 → 解析器 → 聚合器 → LLM 总结 → 代码关联 → 报告发布
+                ↑                        ↓
+          自适应解析器              ReAct Agent 工具链
+```
+
+### 模块设计
+
+#### 1. 日志解析器 (`parser.py`)
+
+采用**多正则模式匹配**策略，按优先级依次尝试：
+
+- **标准格式**: `时间 [线程] 级别 类名 [TID: ...] [traceId] - 消息`
+- **时间简写格式**: `HH:mm:ss.SSS [线程] 级别 logger - [location] - 消息`
+- **包装格式**: 外部日志框架包裹的内部日志行
+- **嵌入式时间格式**: 消息体内嵌的时间简写日志
+
+每条日志行解析为 `LogEvent` 数据类，包含时间戳、级别、线程、logger、traceId、spanId、请求 URI、耗时等字段。解析过程使用**惰性生成器**（generator），支持流式读取大文件而不全量加载到内存。
+
+#### 2. 自适应解析器 (`adaptive_parser.py`)
+
+当 `--adaptive-parser` 启用时，采样日志头部行发送给 LLM，让 LLM 生成一个**受约束的解析正则表达式**。生成的规则会经过验证：在采样行上对比内置规则与动态规则的匹配率，只有提升超过阈值（默认 3 行）才启用。
+
+```text
+采样日志行 → LLM 生成正则 → 验证评分 → 决策（启用/回退）
+```
+
+#### 3. 聚合器 (`aggregator.py`)
+
+遍历所有 `LogEvent`，执行以下分析：
+
+- **端点统计**: 按请求 URI 聚合，计算请求数、平均耗时、慢请求数、错误数、下游依赖
+- **问题识别**: 基于规则引擎匹配已知模式——
+  - 超时（`timed out`、`TimeoutException`）
+  - 连接池告警（`discard long time none received connection`、Druid 告警）
+  - 慢请求（耗时超过阈值，默认 1000ms）
+  - Fallback（`Fallback Reason`、Hystrix/Sentinel 降级）
+  - 未处理异常（`Exception`、`Caused by` 栈）
+- **Trace 采样**: 提取典型 traceId 的完整链路日志片段
+- **敏感信息脱敏**: 自动脱敏邮箱、手机号、IP 地址、Token
+
+#### 4. LLM 客户端 (`llm.py`)
+
+基于标准库 `urllib` 实现的 OpenAI 兼容客户端，零外部依赖：
+
+- 支持 `/v1/chat/completions` 协议
+- 自动从 LLM 响应中提取 JSON（支持 markdown code block 包裹）
+- 内置重试机制（可配置次数与退避策略）
+- 第一阶段：向 LLM 发送聚合摘要，获取高层分析
+- 第二阶段：为每个问题独立构造 prompt 并发请求
+
+#### 5. 代码关联器 (`code_linker.py`)
+
+从日志证据中提取线索，在 Java 源码目录中做静态匹配：
+
+- **类名提取**: 正则匹配 Java 全限定类名、异常栈中的类名
+- **方法名提取**: 匹配 `async method:` 标记和 `类.方法(` 模式
+- **URI 关联**: 搜索 `@RequestMapping`、`@GetMapping`、`@PostMapping` 等 Spring 注解
+- **配置匹配**: 针对数据库连接池问题，搜索 Druid/HikariCP 配置项（`validation-query`、`test-while-idle` 等）
+- **配置文件支持**: `.java`、`.kt`、`.xml`、`.yml`、`.yaml`、`.properties`
+
+#### 6. ReAct Agent (`react_controller.py` + `react_tools.py`)
+
+以 Thought → Action → Observation 循环实现多步调查：
+
+```text
+Planner (LLM)
+    ↓ thought + action
+工具执行器 (ToolRegistry)
+    ↓ observation
+Planner 判断: 继续 / 输出最终结论
+```
+
+**六种内置工具**:
+
+| 工具 | 功能 |
+| ---- | ---- |
+| `list_log_files` | 列出分析范围内的日志文件 |
+| `sample_log_head_tail` | 读取日志文件头尾行，快速了解格式 |
+| `search_logs` | 按关键字搜索日志并返回上下文 |
+| `search_code_symbols` | 在源码中搜索类名、方法名 |
+| `open_code_context` | 打开源码文件指定行附近的上下文 |
+| `get_config_matches` | 搜索配置文件中的连接池/超时等配置项 |
+
+**收敛策略**:
+
+Agent 通过两种机制避免无意义循环：
+
+1. **早期收敛**: 当同时满足（已有代码上下文 + 日志命中 + 源码命中 + 工具覆盖 ≥2 种）时，自动提前结束调查
+2. **无进展终止**: 连续两步工具调用均未产生有效新证据时，提前终止并给出切换策略建议
+
+多个问题的 ReAct 调查通过 `ThreadPoolExecutor` 并发执行。
+
+#### 7. 报告与发布 (`reporter.py` + `publish.py` + `web_cli.py`)
+
+- **Markdown 报告**: 中文结构化报告，包含概述、端点统计、问题详情、修复建议
+- **JSON 输出**: 完整结构化数据，包含 `linked_code_groups`（按文件 → 片段块 → 上下文组织）
+- **Web 报告**: 自动生成静态 HTML 页面，支持历史报告目录索引
+- **钉钉通知**: 可选推送分析摘要到钉钉群
+- **本地 Web 服务**: `analyze-logs-web` 启动静态文件服务，浏览历史报告
+
+## 流程图
+
+### 经典两阶段分析流程
+
+```mermaid
+flowchart TD
+    A[📄 输入日志文件] --> B{启用自适应解析?}
+    B -->|是| C[采样日志行]
+    C --> D[LLM 生成动态正则]
+    D --> E[验证评分]
+    E --> F{提升超过阈值?}
+    F -->|是| G[使用动态规则]
+    F -->|否| H[回退内置规则]
+    B -->|否| H
+
+    G --> I[流式解析日志]
+    H --> I
+
+    I --> J[聚合器: 端点统计]
+    I --> K[聚合器: 问题识别]
+    I --> L[聚合器: Trace 采样]
+    I --> M[聚合器: 敏感信息脱敏]
+
+    J --> N[生成 StageOneSummary]
+    K --> N
+    L --> N
+    M --> N
+
+    N --> O{禁用 LLM?}
+    O -->|是| P[仅输出规则分析结果]
+    O -->|否| Q[第一阶段 LLM 总结]
+    Q --> R[重试机制]
+
+    N --> S{指定源码目录?}
+    S -->|否| T[第二阶段: 无源码 LLM 分析]
+    S -->|是| U[代码关联器: 提取类名/方法名/URI]
+    U --> V[搜索源码匹配]
+    V --> W[第二阶段: 并发 LLM 分析]
+
+    T --> X[生成 StageTwoSummary]
+    W --> X
+
+    P --> Y[生成报告]
+    X --> Y
+
+    Y --> Z1[Markdown 报告]
+    Y --> Z2[JSON 数据]
+    Y --> Z3[HTML Web 页面]
+    Y --> Z4{配置钉钉?}
+    Z4 -->|是| Z5[推送钉钉摘要]
+    Z4 -->|否| Z6[完成]
+    Z5 --> Z6
+```
+
+### ReAct Agent 多步调查流程
+
+```mermaid
+flowchart TD
+    subgraph Input[输入]
+        A1[第一阶段分析结果]
+        A2[日志文件]
+        A3[Java 源码目录]
+    end
+
+    A1 --> B[提取高优先级 Issues]
+    B --> C[并发启动 Agent 实例]
+
+    subgraph AgentLoop[单个 Agent 调查循环]
+        D[初始化 AgentRunState]
+        D --> E{步数 ≤ max_steps?}
+        E -->|否| F[标记 max_steps_reached]
+        E -->|是| G[Planner: LLM 规划下一步]
+        G --> H{LLM 返回 final?}
+        H -->|是| I[记录最终结论]
+        H -->|否| J[执行 Action: 调用工具]
+
+        J --> K{工具执行成功?}
+        K -->|是| L[记录 Observation]
+        K -->|否| M[记录失败 Observation]
+
+        L --> N{满足早期收敛条件?}
+        N -->|是| O[提前结束: 证据充足]
+        N -->|否| P{连续 2 步无进展?}
+        P -->|是| Q[提前终止: 无进展]
+        P -->|否| E
+
+        M --> P
+    end
+
+    subgraph Tools[可用工具集]
+        T1[list_log_files]
+        T2[sample_log_head_tail]
+        T3[search_logs]
+        T4[search_code_symbols]
+        T5[open_code_context]
+        T6[get_config_matches]
+    end
+
+    J -.-> Tools
+
+    F --> R[汇总所有 Agent 结果]
+    I --> R
+    O --> R
+    Q --> R
+
+    R --> S[生成 ReAct 报告]
+    S --> S1[react_summary.md]
+    S --> S2[react_summary.json]
+    S --> S3[per-issue react_run.md/json]
+    S --> S4[site/index.html]
+```
+
+### 数据模型关系
+
+```mermaid
+erDiagram
+    LogEvent {
+        datetime timestamp
+        string level
+        string thread
+        string logger
+        string trace_id
+        string request_uri
+        int cost_ms
+        string message
+        string source_file
+        int line_number
+    }
+
+    EvidenceItem {
+        string label
+        string source
+        int line_number
+        string excerpt
+        string kind
+    }
+
+    Issue {
+        string title
+        string category
+        string severity
+        string description
+        list evidence
+        list related_endpoints
+        list related_classes
+        list trace_ids
+    }
+
+    CodeReference {
+        string file_path
+        int line_number
+        string snippet
+        string reason
+        string class_name
+        string method_name
+    }
+
+    FixSuggestion {
+        string title
+        string confidence
+        list observed_facts
+        list linked_code
+        string fix_direction
+        string llm_suggestion
+        list side_effects
+    }
+
+    StageOneSummary {
+        string generated_at
+        list files
+        dict overview
+        list endpoints
+        list issues
+        list trace_samples
+        dict llm_summary
+        string llm_error
+    }
+
+    StageTwoSummary {
+        string generated_at
+        string source_root
+        list code_matches
+        list suggestions
+        string llm_error
+    }
+
+    AgentRunState {
+        string run_id
+        string status
+        string goal
+        AgentIssue issue
+        list steps
+        bool completed
+        dict final_answer
+    }
+
+    AgentStep {
+        int index
+        string thought
+        AgentAction action
+        AgentObservation observation
+        dict final
+    }
+
+    LogEvent ||--o{ EvidenceItem : "提取为证据"
+    EvidenceItem }o--|| Issue : "归属"
+    Issue ||--o{ CodeReference : "关联源码"
+    Issue ||--o{ FixSuggestion : "生成建议"
+    StageOneSummary ||--o{ Issue : "包含"
+    StageTwoSummary ||--o{ FixSuggestion : "包含"
+    StageTwoSummary ||--o{ CodeReference : "包含"
+    AgentRunState ||--o{ AgentStep : "记录"
+    AgentStep ||--o| AgentAction : "执行"
+    AgentStep ||--o| AgentObservation : "观察"
+```
+
+## 覆盖场景
+
+项目重点覆盖以下 Java 后端日志场景：
 
 - Spring Boot / Spring Cloud 风格日志
 - Java 异常栈、异步异常、线程池日志
@@ -14,7 +345,7 @@
 - Druid / JDBC / MyBatis 相关日志
 - 带时间、级别、线程名、类名、traceId 的后端服务日志
 
-不建议把当前版本理解成“所有日志都能分析”。更准确地说，它是一个“面向常见 Java 后端日志”的分析工具；如果后续要扩展到 Nginx、Redis、Kafka、前端日志、系统日志等，需要继续增加对应解析器。
+不建议把当前版本理解成"所有日志都能分析"。更准确地说，它是一个"面向常见 Java 后端日志"的分析工具；如果后续要扩展到 Nginx、Redis、Kafka、前端日志、系统日志等，需要继续增加对应解析器。
 
 ## 主要能力
 
@@ -28,6 +359,7 @@
 - 第二阶段支持从日志中提取类名、方法名、接口 URI，并关联到 Java 源码
 - 第二阶段按问题分开并发请求 LLM
 - LLM 请求失败支持自动重试
+- 自适应解析器：当内置规则无法匹配时，让 LLM 生成动态解析规则
 
 ## 运行环境
 
@@ -186,6 +518,14 @@ analyze-logs esg-system.log --disable-llm
 ```bash
 analyze-logs esg-hazsub.log --slow-threshold-ms 2000
 ```
+
+### 启用自适应解析器
+
+```bash
+analyze-logs esg-system.log --adaptive-parser
+```
+
+当内置规则无法匹配日志格式时，启用自适应解析器让 LLM 生成动态解析规则。
 
 ## 第二阶段行为说明
 
@@ -353,7 +693,7 @@ analyze-logs-react esg-system.log esg-hazsub.log \
 
 - `linked_code_groups`
 
-它会按“文件 -> 片段块 -> 片段上下文”的方式组织关联代码，便于 Web 页面和报告展示。
+它会按"文件 -> 片段块 -> 片段上下文"的方式组织关联代码，便于 Web 页面和报告展示。
 
 ## 当前已知限制
 
