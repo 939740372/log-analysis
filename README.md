@@ -39,11 +39,167 @@
 
 #### 2. 自适应解析器 (`adaptive_parser.py`)
 
-当 `--adaptive-parser` 启用时，采样日志头部行发送给 LLM，让 LLM 生成一个**受约束的解析正则表达式**。生成的规则会经过验证：在采样行上对比内置规则与动态规则的匹配率，只有提升超过阈值（默认 3 行）才启用。
+这一版 adaptive parser 的目标不是“让 LLM 自由写正则”，而是先由本地规则库提供一组**受约束的候选模板**，再让 LLM 在候选里做选择或极小范围微调。这样能显著降低解析漂移、错误命名组、时间格式失配这类问题。
+
+建议把它理解成一条“四层保险”的链路：
 
 ```text
-采样日志行 → LLM 生成正则 → 验证评分 → 决策（启用/回退）
+样本采集
+  → 本地候选模板库排序
+  → LLM 选择候选 / 微调少量字段
+  → 本地验证、评分、决策、必要时回退
 ```
+
+### Adaptive Parser 工作机制
+
+#### 1. 本地候选规则库
+
+当前内置的候选模板主要覆盖几类常见 Java 后端及周边日志：
+
+- `spring_tid_trace`
+  适合标准 Spring 风格、带 `TID` / `traceId` 的文本日志。
+- `spring_json_plain`
+  适合 JSON 行日志或接近 JSON 结构的 Spring 输出。
+- `spring_boot_pid_thread`
+  适合 Spring Boot 启动类日志，例如 `timestamp level pid --- [thread] logger : message`。
+- `time_only_method`
+  适合只有 `HH:mm:ss.SSS` 时间、没有日期的简写日志。
+- `nacos_dubbo_bootstrap`
+  适合 Nacos、Dubbo、配置中心、启动引导类日志。
+- `wrapper_embedded_spring`
+  适合 Tanuki / Java Service Wrapper 外层包裹、消息体中再嵌套 Spring 日志的格式。
+- `tanuki_wrapper_plain`
+  适合 Wrapper 外层日志本身就足够可解析的场景。
+- `tomcat_catalina_juli`
+  适合 Tomcat Catalina / JULI 风格日志。
+
+这些模板都不是一次性硬编码死规则，而是“候选库 + 场景评分”的组合。不同日志类型会先做本地匹配打分，再决定是否值得交给 LLM 参与。
+
+#### 2. 采样与候选排序
+
+当传入 `--adaptive-parser` 时，程序不会直接对整份大日志做动态推断，而是先抽取一个可控样本集：
+
+- 默认采样前 `80` 行，可通过 `--adaptive-sample-lines` 调整。
+- 会额外补采包含 `ERROR`、`WARN`、`Exception`、`Caused by`、`timed out`、`Fallback` 等关键词的代表性行。
+- 样本既用于“让 LLM 看懂格式”，也用于“本地评分比较 adaptive 是否真的优于内置解析器”。
+
+本地排序时会考虑：
+
+- 时间戳是否能稳定命中
+- 日志级别是否可抽取
+- 线程名、logger、消息体是否结构清晰
+- 是否包含典型场景特征
+  - 例如 Wrapper 外层前缀
+  - Nacos / Dubbo / bootstrap 关键词
+  - 内嵌 Spring 日志的二层结构
+
+其中 `wrapper_embedded_spring` 的评分逻辑专门做过收紧：只有先命中外层 Wrapper，再在消息体里命中内嵌 Spring 结构，才会拿到额外加权，避免把普通行误判成嵌套日志。
+
+#### 3. LLM 的职责边界
+
+LLM 在 adaptive parser 里是“受约束协助者”，不是自由生成器。它的职责被限定为：
+
+- 从候选规则中选择最合适的 `candidate_name`
+- 在必要时返回少量 `tuned_fields`
+- 解释为什么这个候选更适合当前样本
+
+它**不应该**凭空生成一套完全新的高自由度 regex。这样做是为了尽量把稳定性保留在本地规则系统里，把 LLM 的价值用在“识别日志风格”和“微调少量参数”上。
+
+#### 4. 启用条件
+
+adaptive parser 只有在“确实比内置解析器更好”时才会被启用。当前启用判定主要包括三层：
+
+1. 规则必须合法
+
+- 正则需要可编译
+- 命名捕获组只能使用系统允许的字段名
+- 时间格式必须可转换为 Python `strptime`
+- 动态规则不能突破安全边界
+
+2. 采样评分必须达标
+
+- 程序会分别计算“内置解析器得分”和“动态规则得分”
+- 默认要求动态规则至少比内置规则高 `1` 分
+- 这个阈值由 `adaptive_validation_improvement` 控制，当前默认值已经从早期版本的 `3` 下调到了 `1`
+
+3. 白名单模板可以走更温和的启用策略
+
+当前有几个模板允许在“打平”或“小分差”时启用：
+
+- `wrapper_embedded_spring`
+- `nacos_dubbo_bootstrap`
+- `time_only_method`
+
+这样做是因为这些场景往往存在天然噪声，例如：
+
+- Wrapper 外层行和内层真实业务日志混排
+- 启动日志里大量 banner / bootstrap 行
+- `Caused by`、堆栈续行天然不满足完整结构
+- 时间简写日志需要结合文件名补日期
+
+#### 5. 回退策略
+
+adaptive parser 的一个核心目标是“宁可回退，也不要把主流程搞坏”。因此它内置了多层回退：
+
+- LLM 不可用时，继续走内置解析器
+- LLM 返回内容不是合法 JSON 时，尝试做一次 JSON 修复
+- 修复仍失败时，回退到本地内置规则
+- 如果动态规则评分没有明显提升，回退到内置规则
+- 如果规则安全校验失败，回退到内置规则
+
+此外还有一个重要兜底：
+
+- 如果 LLM 返回不合法，但本地候选库里某个模板分数**明显领先**，系统会直接采用这个高置信本地候选，而不是把整轮 adaptive 判成失败
+
+这也是为什么现在的 adaptive parser 更像“本地规则主导，LLM 协助决策”，而不是“完全依赖 LLM 生成解析规则”。
+
+#### 6. 特殊能力
+
+当前 adaptive parser 额外支持两类对真实日志很实用的能力：
+
+1. 文件名补日期
+
+对于只写 `HH:mm:ss.SSS` 的日志，如果文件名里带有类似 `2026-07-01` 这样的日期，`time_only_method` 可以自动把日期回填到事件时间戳里。
+
+2. 外层包裹 + 内层日志拆解
+
+对于 Tanuki Wrapper / Java Service Wrapper 这类“外层是 wrapper 前缀，内层才是真正 Spring 日志”的格式，adaptive parser 会优先识别外层，再对消息体做 embedded 判断，而不是简单对整行重复套一遍内嵌规则。
+
+#### 7. 什么时候会启用，什么时候会回退
+
+可以把启用条件简化理解为：
+
+- 命中合适候选
+- 候选经过 LLM 选择或微调后仍然合法
+- 样本评分优于内置规则，或者满足白名单容差条件
+
+以下情况通常会回退：
+
+- 样本太少，无法证明动态规则更优
+- 当前日志其实已经被内置解析器很好处理
+- LLM 选择了不合适的候选
+- LLM 返回结构损坏且本地也没有明显领先候选
+
+#### 8. 输出与可观测性
+
+启用 `--adaptive-parser` 后，输出目录里会额外生成 `adaptive_parser.json`，用于解释这轮 adaptive 到底发生了什么。该文件通常会包含：
+
+- `enabled`
+  是否最终启用了动态规则
+- `reason`
+  启用或回退原因
+- `base_score`
+  内置规则样本评分
+- `dynamic_score`
+  动态规则样本评分
+- `sample_lines`
+  实际参与判断的采样规模
+- `dynamic_rule`
+  最终采用的候选或微调后规则
+- `llm_response`
+  LLM 原始或修复后的结构化结果
+
+如果你在真实验收里想判断 adaptive 是否“有命中价值”，最直接的方法就是看这个文件里的 `enabled`、`reason`、`base_score` 和 `dynamic_score`。
 
 #### 3. 聚合器 (`aggregator.py`)
 
@@ -127,9 +283,9 @@ Agent 通过两种机制避免无意义循环：
 flowchart TD
     A[📄 输入日志文件] --> B{启用自适应解析?}
     B -->|是| C[采样日志行]
-    C --> D[LLM 生成动态正则]
+    C --> D[候选规则库排序 + LLM 选择/微调]
     D --> E[验证评分]
-    E --> F{提升超过阈值?}
+    E --> F{评分提升或满足容差?}
     F -->|是| G[使用动态规则]
     F -->|否| H[回退内置规则]
     B -->|否| H
@@ -359,7 +515,7 @@ erDiagram
 - 第二阶段支持从日志中提取类名、方法名、接口 URI，并关联到 Java 源码
 - 第二阶段按问题分开并发请求 LLM
 - LLM 请求失败支持自动重试
-- 自适应解析器：当内置规则无法匹配时，让 LLM 生成动态解析规则
+- 自适应解析器：当内置规则不够贴合时，使用“本地候选模板库 + LLM 选择/微调 + 本地验证回退”机制提升解析命中率
 
 ## 运行环境
 
@@ -525,7 +681,7 @@ analyze-logs esg-hazsub.log --slow-threshold-ms 2000
 analyze-logs esg-system.log --adaptive-parser
 ```
 
-当内置规则无法匹配日志格式时，启用自适应解析器让 LLM 生成动态解析规则。
+当日志格式和内置规则不完全匹配时，可以启用自适应解析器。它会先用本地候选模板库做筛选，再让 LLM 在候选中选择或微调，最后由本地评分系统决定是否真正启用该规则。
 
 ## 第二阶段行为说明
 

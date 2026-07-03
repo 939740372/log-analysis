@@ -15,6 +15,7 @@ from .llm import (
     OpenAICompatibleLLMClient,
     build_stage_one_messages,
     build_stage_two_issue_messages,
+    build_stage_two_issue_repair_messages,
 )
 from .models import CodeReference, FixSuggestion, StageTwoSummary
 from .output_paths import ensure_output_root, resolve_output_dir
@@ -43,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--adaptive-validation-improvement",
         type=int,
-        default=3,
+        default=1,
         help="动态规则相对内置规则至少提升多少评分才启用。",
     )
     parser.add_argument("--report-base-url", help="报告站点的外部访问基地址，例如 https://example.com/reports")
@@ -137,6 +138,28 @@ def _convert_issue_llm_result(
     )
 
 
+def _repair_stage_two_issue_result(
+    client: OpenAICompatibleLLMClient,
+    issue,
+    issue_matches: list[CodeReference],
+    raw_text: str,
+) -> FixSuggestion | None:
+    try:
+        result = client.create_chat_completion(
+            build_stage_two_issue_repair_messages(raw_text),
+            max_completion_tokens=700,
+        )
+    except LLMError:
+        return None
+    parsed = result.parsed_json
+    if isinstance(parsed, dict) and {"title", "fix_direction", "llm_suggestion"} <= set(parsed.keys()):
+        return _convert_issue_llm_result(issue, parsed, issue_matches, result.raw_text)
+    suggestion_items = _normalize_llm_suggestions(parsed)
+    if suggestion_items:
+        return _convert_issue_llm_result(issue, suggestion_items[0], issue_matches, result.raw_text)
+    return None
+
+
 def _run_single_stage_two_issue_llm(
     client: OpenAICompatibleLLMClient,
     issue,
@@ -156,6 +179,9 @@ def _run_single_stage_two_issue_llm(
             suggestion_items = _normalize_llm_suggestions(parsed)
             if suggestion_items:
                 return _convert_issue_llm_result(issue, suggestion_items[0], issue_matches, result.raw_text), None
+            repaired = _repair_stage_two_issue_result(client, issue, issue_matches, result.raw_text)
+            if repaired is not None:
+                return repaired, None
             last_error = "LLM 返回结果中没有合法的建议对象"
         except LLMError as exc:
             last_error = str(exc)

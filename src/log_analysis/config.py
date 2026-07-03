@@ -33,4 +33,4 @@ class AnalysisConfig:
     max_code_matches: int = 30
     redact_sensitive: bool = True
     adaptive_sample_lines: int = 80
-    adaptive_validation_improvement: int = 3
+    adaptive_validation_improvement: int = 1

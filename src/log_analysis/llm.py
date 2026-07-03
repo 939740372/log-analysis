@@ -167,23 +167,42 @@ def build_stage_two_issue_messages(input_payload: dict) -> list[dict]:
     ]
 
 
+def build_stage_two_issue_repair_messages(raw_text: str) -> list[dict]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是一名 JSON 修复助手。"
+                "请把给定内容修复成一个合法的简体中文 JSON 对象。"
+                "不要解释，不要输出 Markdown，只输出 JSON。"
+                "返回对象必须包含 title、confidence、observed_facts、fix_direction、llm_suggestion、side_effects。"
+                "observed_facts 和 side_effects 必须是数组。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": raw_text,
+        },
+    ]
+
+
 def build_adaptive_parser_messages(input_payload: dict) -> list[dict]:
     return [
         {
             "role": "system",
             "content": (
                 "你是一名日志格式归纳专家。请仅返回简体中文 JSON，不要返回 Markdown。"
-                "目标是给出一个安全、可验证的日志切割规则，而不是分析业务含义。"
-                "返回对象必须包含 format_name、strategy、outer_regex、outer_timestamp_format。"
-                "strategy 只能是 direct 或 wrapper_embedded。"
-                "如为 wrapper_embedded，可额外返回 embedded_regex、embedded_timestamp_format、"
-                "embedded_uses_outer_date、logger_literal。"
+                "目标是从给定候选规则中选择最合适的一条，必要时仅做小范围微调，而不是自由生成新正则。"
+                "返回对象必须包含 candidate_name。"
+                "如需微调，可额外返回 tuned_fields。"
+                "candidate_name 必须来自用户提供的 candidate_rules。"
+                "tuned_fields 只能包含 format_name、strategy、outer_regex、outer_timestamp_format、"
+                "embedded_regex、embedded_timestamp_format、embedded_uses_outer_date、logger_literal。"
                 "regex 只允许命名捕获组 timestamp、level、thread、logger、message。"
-                "如果样本明显是外层包装日志包裹内层 Spring 日志，优先返回 wrapper_embedded。"
+                "如果候选里已经有高匹配规则，优先直接选择，不要重写。"
                 "不要输出解释文字。"
                 "请严格按以下 JSON 结构返回："
-                '{"format_name":"格式名","strategy":"direct或wrapper_embedded","outer_regex":"正则","outer_timestamp_format":"时间格式",'
-                '"embedded_regex":"可选","embedded_timestamp_format":"可选","embedded_uses_outer_date":true,"logger_literal":"可选"}'
+                '{"candidate_name":"候选名","tuned_fields":{"outer_regex":"可选微调","embedded_regex":"可选微调"}}'
             ),
         },
         {
@@ -201,7 +220,9 @@ def build_adaptive_parser_repair_messages(raw_text: str) -> list[dict]:
                 "你是一名 JSON 修复助手。"
                 "请把给定内容修复成一个合法的 JSON 对象。"
                 "不要解释，不要补充分析，只输出 JSON。"
-                "必须包含 format_name、strategy、outer_regex、outer_timestamp_format。"
+                "必须包含 candidate_name。"
+                "如有 tuned_fields，tuned_fields 只能包含 format_name、strategy、outer_regex、outer_timestamp_format、"
+                "embedded_regex、embedded_timestamp_format、embedded_uses_outer_date、logger_literal。"
                 "strategy 只能是 direct 或 wrapper_embedded。"
                 "regex 只允许命名捕获组 timestamp、level、thread、logger、message。"
             ),
